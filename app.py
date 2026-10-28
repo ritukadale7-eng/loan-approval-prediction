@@ -1,45 +1,105 @@
-
 import os
 import pickle
+import warnings
  
 import pandas as pd
 from flask import Flask, render_template_string, request
  
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "logistic.pkl")
+warnings.filterwarnings("ignore")
  
 app = Flask(__name__)
  
+# --------------------------------------------------------------------------
+# Load model
+# --------------------------------------------------------------------------
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logistic.pkl")
 with open(MODEL_PATH, "rb") as f:
     model = pickle.load(f)
  
-FEATURES = list(model.feature_names_in_)
+FEATURES = list(model.feature_names_in_)    # exact column order the model expects
+CLASSES = [int(c) for c in model.classes_]  # [0, 1]  ->  0 = rejected, 1 = approved
  
-# Label encodings (alphabetical, as produced by sklearn LabelEncoder).
-# If your training notebook used different codes, change them here.
-GENDER = {"Female": 0, "Male": 1}
-MARRIED = {"No": 0, "Yes": 1}
-DEPENDENTS = {"0": 0, "1": 1, "2": 2, "3+": 3}
-EDUCATION = {"Graduate": 0, "Not Graduate": 1}
-SELF_EMPLOYED = {"No": 0, "Yes": 1}
-CREDIT = {"Good (1)": 1, "None / poor (0)": 0}
-PROPERTY = {"Rural": 0, "Semiurban": 1, "Urban": 2}
+# --------------------------------------------------------------------------
+# Label-encoded categories (alphabetical, like sklearn's LabelEncoder).
+# Position in each list = the number the model receives. Rename if yours differ.
+# --------------------------------------------------------------------------
+GENDER     = ["Female", "Male"]
+YES_NO     = ["No", "Yes"]
+DEPENDENTS = ["0", "1", "2", "3+"]
+EDUCATION  = ["Graduate", "Not Graduate"]
+AREA       = ["Rural", "Semiurban", "Urban"]
+TERMS      = [12, 36, 60, 84, 120, 180, 240, 300, 360, 480]   # months
  
-DEFAULTS = {
-    "gender": "Male",
-    "married": "Yes",
-    "dependents": "0",
-    "education": "Graduate",
-    "self_employed": "No",
-    "applicant_income": 5000,
-    "coapplicant_income": 0,
-    "loan_amount": 130,
-    "loan_term": 360,
-    "credit_history": "Good (1)",
-    "property_area": "Urban",
-}
  
-PAGE = """
+def opts(lst):
+    return list(enumerate(lst))
+ 
+ 
+# --------------------------------------------------------------------------
+# Form definition
+# --------------------------------------------------------------------------
+SECTIONS = [
+    {"title": "👤 Applicant Details", "fields": [
+        {"name": "Gender", "label": "Gender", "kind": "select", "options": opts(GENDER), "default": 1},
+        {"name": "Married", "label": "Married", "kind": "select", "options": opts(YES_NO), "default": 1},
+        {"name": "Dependents", "label": "Dependents", "kind": "select", "options": opts(DEPENDENTS), "default": 0},
+        {"name": "Education", "label": "Education", "kind": "select", "options": opts(EDUCATION), "default": 0},
+        {"name": "Self_Employed", "label": "Self Employed", "kind": "select", "options": opts(YES_NO), "default": 0},
+    ]},
+    {"title": "💰 Income", "fields": [
+        {"name": "ApplicantIncome", "label": "Applicant Income (monthly)", "kind": "number",
+         "min": 0, "max": 100000, "step": 100, "default": 5000},
+        {"name": "CoapplicantIncome", "label": "Co-applicant Income (monthly)", "kind": "number",
+         "min": 0, "max": 50000, "step": 100, "default": 1500},
+        {"name": "Credit_History", "label": "Credit History", "kind": "select",
+         "options": [(1, "Good (meets guidelines)"), (0, "Poor (does not meet guidelines)")], "default": 1},
+    ]},
+    {"title": "🏠 Loan Request", "fields": [
+        {"name": "LoanAmount", "label": "Loan Amount (in thousands)", "kind": "range",
+         "min": 10, "max": 700, "step": 1, "default": 130},
+        {"name": "Loan_Amount_Term", "label": "Loan Term (months)", "kind": "select",
+         "options": [(t, f"{t} months ({t // 12} yr)") for t in TERMS], "default": 360},
+        {"name": "Property_Area", "label": "Property Area", "kind": "select",
+         "options": opts(AREA), "default": 1},
+    ]},
+]
+ 
+ 
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+def verdict_info(p: float) -> dict:
+    """p = approval probability in 0-100."""
+    if p >= 65:
+        return {"level": "High Chance", "verdict": "Likely Approved", "icon": "✅", "color": "#10b981",
+                "msg": "This application matches the profile of approved loans."}
+    if p >= 40:
+        return {"level": "Borderline", "verdict": "Needs Review", "icon": "⚖️", "color": "#fbbf24",
+                "msg": "Signals are mixed. A manual review is recommended."}
+    return {"level": "Low Chance", "verdict": "Likely Rejected", "icon": "❌", "color": "#f43f5e",
+            "msg": "This application resembles loans that were not approved."}
+ 
+ 
+def build_tips(v: dict) -> list:
+    tips = []
+    if int(v["Credit_History"]) == 0:
+        tips.append("📉 Poor credit history is the biggest factor, so clearing past dues would help most.")
+    else:
+        tips.append("💳 A good credit history is the strongest positive signal here.")
+    total_income = v["ApplicantIncome"] + v["CoapplicantIncome"]
+    if total_income < 4000:
+        tips.append("💼 Household income is on the lower side; adding a co-applicant may strengthen the case.")
+    if v["CoapplicantIncome"] == 0:
+        tips.append("🤝 No co-applicant income is listed. A co-applicant can improve repayment capacity.")
+    if int(v["Self_Employed"]) == 1:
+        tips.append("📄 Self-employed applicants should keep income proof and tax returns ready.")
+    return tips[:4]
+ 
+ 
+# --------------------------------------------------------------------------
+# HTML template
+# --------------------------------------------------------------------------
+TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -47,317 +107,203 @@ PAGE = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Loan Approval Predictor</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --indigo: #2a1f6b;
-    --indigo-2: #43349a;
-    --emerald: #10a56b;
-    --emerald-soft: #def6ea;
-    --rose: #e0485e;
-    --rose-soft: #fde7ea;
-    --gold: #f4b63f;
-    --paper: #f5f4fb;
-    --card: #ffffff;
-    --line: #e1def2;
-    --text: #1e1a3d;
-    --muted: #716e8f;
+  :root{
+    --bg1:#071226; --bg2:#0f1f45; --card:rgba(255,255,255,.07); --border:rgba(255,255,255,.14);
+    --text:#eff4ff; --muted:#9fb0d0; --gold:#fbbf24; --green:#10b981; --sky:#38bdf8;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: "Outfit", system-ui, -apple-system, "Segoe UI", sans-serif;
-    background: var(--paper); color: var(--text);
-    min-height: 100vh; line-height: 1.5;
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:'Plus Jakarta Sans',system-ui,sans-serif;color:var(--text);min-height:100vh;padding:34px 16px 60px;
+    background:
+      radial-gradient(800px 480px at 0% 0%, rgba(251,191,36,.20), transparent 60%),
+      radial-gradient(800px 520px at 100% 5%, rgba(56,189,248,.24), transparent 60%),
+      radial-gradient(700px 500px at 50% 115%, rgba(16,185,129,.20), transparent 60%),
+      linear-gradient(160deg,var(--bg1),var(--bg2));
+    background-attachment:fixed;
   }
-  .shell { display: grid; grid-template-columns: 370px 1fr; min-height: 100vh; }
+  .wrap{max-width:1080px;margin:0 auto}
+  header{text-align:center;margin-bottom:30px}
+  .badge{display:inline-block;padding:6px 16px;border-radius:999px;font-size:12px;font-weight:600;
+    letter-spacing:.08em;text-transform:uppercase;color:var(--gold);
+    background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.38)}
+  h1{font-size:clamp(28px,5vw,46px);font-weight:800;margin:14px 0 8px;
+    background:linear-gradient(90deg,#fff,var(--gold) 45%,var(--sky));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  header p{color:var(--muted);max-width:560px;margin:0 auto;font-size:15px}
  
-  /* ---------- side panel ---------- */
-  .side {
-    background: linear-gradient(160deg, var(--indigo) 0%, var(--indigo-2) 100%);
-    color: #fff; padding: 56px 40px;
-    display: flex; flex-direction: column; justify-content: space-between;
-    position: relative; overflow: hidden;
-  }
-  .side::after {
-    content: ""; position: absolute; right: -90px; bottom: -90px;
-    width: 280px; height: 280px; border-radius: 50%;
-    background: radial-gradient(circle, rgba(244,182,63,.45), rgba(244,182,63,0) 70%);
-  }
-  .logo { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; }
-  .logo i {
-    width: 34px; height: 34px; border-radius: 10px; background: var(--gold); color: var(--indigo);
-    display: grid; place-items: center; font-style: normal; font-weight: 800;
-  }
-  .side h1 { font-size: 38px; line-height: 1.12; font-weight: 800; margin: 56px 0 16px; }
-  .side p { color: #cfcaf0; font-size: 15px; max-width: 290px; }
-  .legend { display: grid; gap: 12px; margin-top: 34px; font-size: 14px; position: relative; z-index: 1; }
-  .legend div { display: flex; align-items: center; gap: 10px; color: #e6e3fa; }
-  .dot { width: 12px; height: 12px; border-radius: 50%; }
-  .dot.ok { background: var(--emerald); }
-  .dot.no { background: var(--rose); }
-  .foot { font-size: 12px; color: #a39fd6; position: relative; z-index: 1; }
+  /* result */
+  .result{margin-bottom:28px;padding:30px;border-radius:24px;display:flex;gap:34px;align-items:center;
+    justify-content:center;flex-wrap:wrap;
+    background:linear-gradient(135deg,color-mix(in srgb,var(--rc) 20%,transparent),rgba(255,255,255,.04));
+    border:1px solid color-mix(in srgb,var(--rc) 55%,transparent);
+    box-shadow:0 0 60px color-mix(in srgb,var(--rc) 22%,transparent);animation:pop .5s ease}
+  @keyframes pop{from{opacity:0;transform:translateY(14px) scale(.98)}to{opacity:1;transform:none}}
+  .ring{position:relative;width:190px;height:190px}
+  .ring svg{transform:rotate(-90deg)}
+  .ring .bg{stroke:rgba(255,255,255,.12)}
+  .ring .fg{stroke:var(--rc);stroke-linecap:round;stroke-dasharray:502;stroke-dashoffset:502;
+    animation:fill 1.2s ease forwards;filter:drop-shadow(0 0 8px var(--rc))}
+  @keyframes fill{to{stroke-dashoffset:calc(502 - 502 * var(--pct) / 100)}}
+  .ring .center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+  .ring .num{font-size:42px;font-weight:800;line-height:1}
+  .ring .of{font-size:12px;color:var(--muted);margin-top:4px}
+  .info{max-width:440px}
+  .level{display:inline-block;font-size:13px;font-weight:700;padding:4px 14px;border-radius:999px;
+    background:var(--rc);color:#061225;margin-bottom:10px}
+  .info h2{font-size:28px;margin-bottom:6px}
+  .info p.msg{color:#d3def5;font-size:14px;margin-bottom:14px}
+  .bars{margin-bottom:14px}
+  .bar-row{display:flex;align-items:center;gap:10px;margin:7px 0;font-size:13px}
+  .bar-row .n{width:62px;color:var(--muted)}
+  .track{flex:1;height:10px;border-radius:99px;background:rgba(255,255,255,.1);overflow:hidden}
+  .fill{height:100%;border-radius:99px}
+  .bar-row .v{width:48px;text-align:right;font-weight:600}
+  .tips{list-style:none;display:grid;gap:8px}
+  .tips li{font-size:13px;padding:9px 12px;border-radius:12px;background:rgba(255,255,255,.07);
+    border:1px solid var(--border)}
  
-  /* ---------- main ---------- */
-  .main { padding: 56px 64px; max-width: 940px; width: 100%; }
-  .main h2 { font-size: 26px; font-weight: 700; color: var(--indigo); }
-  .main .sub { color: var(--muted); margin: 4px 0 28px; font-size: 14px; }
+  .error{background:rgba(244,63,94,.15);border:1px solid rgba(244,63,94,.5);
+    padding:14px 18px;border-radius:14px;margin-bottom:20px}
  
-  form.card {
-    background: var(--card); border: 1px solid var(--line); border-radius: 20px;
-    padding: 32px; box-shadow: 0 12px 32px rgba(42, 31, 107, 0.07);
-  }
-  .group-title { font-size: 14px; font-weight: 700; color: var(--indigo-2); margin-bottom: 14px; }
-  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px 22px; margin-bottom: 28px; }
-  .field label { display: block; font-size: 13px; font-weight: 600; color: var(--indigo); margin-bottom: 6px; }
-  .field input, .field select {
-    width: 100%; height: 46px; padding: 0 14px;
-    border: 1.5px solid var(--line); border-radius: 12px;
-    background: #faf9fe; color: var(--text); font: inherit; font-size: 15px;
-    transition: border-color .15s, box-shadow .15s, background .15s;
-  }
-  .field input:focus, .field select:focus {
-    outline: none; border-color: var(--indigo-2); background: #fff;
-    box-shadow: 0 0 0 4px rgba(67, 52, 154, 0.14);
-  }
-  .field small { color: var(--muted); font-size: 12px; }
+  /* form */
+  form{display:grid;gap:20px}
+  .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:22px;
+    backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+  .card h2{font-size:17px;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+  .field{margin-bottom:16px}.field:last-child{margin-bottom:0}
+  label{display:flex;justify-content:space-between;font-size:13px;font-weight:500;color:var(--muted);margin-bottom:7px}
+  label output{color:var(--gold);font-weight:700}
+  select,input[type=number]{width:100%;padding:11px 12px;border-radius:12px;font:inherit;color:var(--text);
+    background:rgba(6,14,32,.6);border:1px solid var(--border);outline:none;transition:.2s}
+  select option{background:#0f1f45}
+  select:focus,input[type=number]:focus{border-color:var(--sky);box-shadow:0 0 0 3px rgba(56,189,248,.25)}
+  input[type=range]{width:100%;-webkit-appearance:none;height:6px;border-radius:99px;outline:none;
+    background:linear-gradient(90deg,var(--gold),var(--sky))}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;
+    background:#fff;border:3px solid var(--gold);cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+  input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#fff;
+    border:3px solid var(--gold);cursor:pointer}
  
-  button {
-    width: 100%; height: 54px; border: 0; border-radius: 14px;
-    background: linear-gradient(90deg, var(--indigo), var(--indigo-2));
-    color: #fff; font: inherit; font-weight: 700; font-size: 16px; cursor: pointer;
-    box-shadow: 0 10px 22px rgba(42, 31, 107, 0.3);
-    transition: transform .12s;
-  }
-  button:hover { transform: translateY(-1px); }
-  button:focus-visible { outline: 3px solid var(--gold); outline-offset: 2px; }
- 
-  /* ---------- result ---------- */
-  .result {
-    margin-top: 28px; padding: 28px 32px; border-radius: 20px; border: 1px solid;
-    display: grid; grid-template-columns: auto 1fr; gap: 24px; align-items: center;
-  }
-  .result.ok { background: var(--emerald-soft); border-color: #a7e0c4; }
-  .result.no { background: var(--rose-soft); border-color: #f4b9c1; }
-  .badge {
-    width: 84px; height: 84px; border-radius: 50%;
-    display: grid; place-items: center; font-size: 30px; font-weight: 800; color: #fff;
-  }
-  .ok .badge { background: var(--emerald); }
-  .no .badge { background: var(--rose); }
-  .result h3 { font-size: 22px; font-weight: 800; color: var(--indigo); }
-  .result p { color: var(--muted); font-size: 14px; margin-bottom: 14px; }
-  .bar { height: 12px; background: #fff; border-radius: 99px; overflow: hidden; display: flex; }
-  .bar span:first-child { background: var(--emerald); }
-  .bar span:last-child  { background: var(--rose); }
-  .bar-labels { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; margin-top: 8px; }
-  .bar-labels .a { color: var(--emerald); }
-  .bar-labels .r { color: var(--rose); }
- 
-  .error {
-    margin-top: 20px; padding: 14px 18px; border-radius: 12px;
-    background: #fff4e0; border: 1px solid #f7d79a; color: #8a5a00; font-size: 14px;
-  }
- 
-  @media (max-width: 900px) {
-    .shell { grid-template-columns: 1fr; }
-    .side { padding: 32px 24px; }
-    .side h1 { margin-top: 28px; font-size: 30px; }
-    .legend { margin: 24px 0 0; }
-    .foot { margin-top: 24px; }
-    .main { padding: 32px 20px; }
-  }
-  @media (max-width: 560px) {
-    .grid { grid-template-columns: 1fr; }
-    .result { grid-template-columns: 1fr; text-align: center; justify-items: center; }
-  }
+  .actions{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:6px}
+  button,.reset{padding:15px 38px;border-radius:14px;border:0;font:inherit;font-weight:700;font-size:16px;
+    cursor:pointer;transition:.2s;text-decoration:none;display:inline-block}
+  button{color:#061225;background:linear-gradient(90deg,var(--gold),#34d399);
+    box-shadow:0 10px 30px rgba(251,191,36,.3)}
+  button:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(52,211,153,.4)}
+  .reset{color:var(--text);background:var(--card);border:1px solid var(--border)}
+  .reset:hover{background:rgba(255,255,255,.12)}
+  footer{text-align:center;color:var(--muted);font-size:12px;margin-top:34px;max-width:620px;
+    margin-left:auto;margin-right:auto}
 </style>
 </head>
 <body>
-<div class="shell">
+<div class="wrap">
+  <header>
+    <span class="badge">Logistic Regression · FinTech</span>
+    <h1>Loan Approval Predictor</h1>
+    <p>Enter the applicant's details and loan request to estimate the chance of approval.</p>
+  </header>
  
-  <aside class="side">
-    <div>
-      <span class="logo"><i>L</i> Loan Approval Predictor</span>
-      <h1>Will the loan be approved?</h1>
-      <p>Enter the applicant's details and the logistic regression model estimates the chance of approval.</p>
-      <div class="legend">
-        <div><span class="dot ok"></span> Likely approved</div>
-        <div><span class="dot no"></span> Likely rejected</div>
-      </div>
+  {% if error %}<div class="error">⚠️ {{ error }}</div>{% endif %}
+ 
+  {% if result %}
+  <div class="result" style="--rc: {{ result.color }}; --pct: {{ result.p_yes }}">
+    <div class="ring">
+      <svg width="190" height="190" viewBox="0 0 190 190">
+        <circle class="bg" cx="95" cy="95" r="80" fill="none" stroke-width="14"/>
+        <circle class="fg" cx="95" cy="95" r="80" fill="none" stroke-width="14"/>
+      </svg>
+      <div class="center"><span class="num">{{ result.p_yes }}%</span><span class="of">approval chance</span></div>
     </div>
-    <div class="foot">Logistic Regression &middot; scikit-learn</div>
-  </aside>
- 
-  <main class="main">
-    <h2>Applicant details</h2>
-    <p class="sub">All fields are required.</p>
- 
-    <form class="card" method="POST" action="/">
-      <div class="group-title">Personal</div>
-      <div class="grid">
-        <div class="field">
-          <label for="gender">Gender</label>
-          <select id="gender" name="gender">
-            {% for o in gender %}<option value="{{ o }}" {{ 'selected' if v.gender == o }}>{{ o }}</option>{% endfor %}
-          </select>
-        </div>
-        <div class="field">
-          <label for="married">Married</label>
-          <select id="married" name="married">
-            {% for o in married %}<option value="{{ o }}" {{ 'selected' if v.married == o }}>{{ o }}</option>{% endfor %}
-          </select>
-        </div>
-        <div class="field">
-          <label for="dependents">Dependents</label>
-          <select id="dependents" name="dependents">
-            {% for o in dependents %}<option value="{{ o }}" {{ 'selected' if v.dependents == o }}>{{ o }}</option>{% endfor %}
-          </select>
-        </div>
-        <div class="field">
-          <label for="education">Education</label>
-          <select id="education" name="education">
-            {% for o in education %}<option value="{{ o }}" {{ 'selected' if v.education == o }}>{{ o }}</option>{% endfor %}
-          </select>
-        </div>
-        <div class="field">
-          <label for="self_employed">Self employed</label>
-          <select id="self_employed" name="self_employed">
-            {% for o in self_employed %}<option value="{{ o }}" {{ 'selected' if v.self_employed == o }}>{{ o }}</option>{% endfor %}
-          </select>
-        </div>
-        <div class="field">
-          <label for="property_area">Property area</label>
-          <select id="property_area" name="property_area">
-            {% for o in property_area %}<option value="{{ o }}" {{ 'selected' if v.property_area == o }}>{{ o }}</option>{% endfor %}
-          </select>
-        </div>
+    <div class="info">
+      <span class="level">{{ result.icon }} {{ result.level }}</span>
+      <h2>{{ result.verdict }}</h2>
+      <p class="msg">{{ result.msg }}</p>
+      <div class="bars">
+        <div class="bar-row"><span class="n">Approved</span>
+          <div class="track"><div class="fill" style="width:{{ result.p_yes }}%;background:#10b981"></div></div>
+          <span class="v">{{ result.p_yes }}%</span></div>
+        <div class="bar-row"><span class="n">Rejected</span>
+          <div class="track"><div class="fill" style="width:{{ result.p_no }}%;background:#f43f5e"></div></div>
+          <span class="v">{{ result.p_no }}%</span></div>
       </div>
+      <ul class="tips">{% for t in result.tips %}<li>{{ t }}</li>{% endfor %}</ul>
+    </div>
+  </div>
+  {% endif %}
  
-      <div class="group-title">Income and loan</div>
-      <div class="grid">
+  <form method="POST" action="/">
+    <div class="grid3">
+    {% for s in sections %}
+      <div class="card">
+        <h2>{{ s.title }}</h2>
+        {% for f in s.fields %}
         <div class="field">
-          <label for="applicant_income">Applicant income (monthly)</label>
-          <input id="applicant_income" type="number" name="applicant_income" min="0" step="any" value="{{ v.applicant_income }}" required>
+          {% set val = values.get(f.name, f.default) %}
+          {% if f.kind == 'select' %}
+            <label for="{{ f.name }}">{{ f.label }}</label>
+            <select id="{{ f.name }}" name="{{ f.name }}">
+              {% for code, text in f.options %}
+              <option value="{{ code }}" {{ 'selected' if code|string == val|string }}>{{ text }}</option>
+              {% endfor %}
+            </select>
+          {% elif f.kind == 'range' %}
+            <label for="{{ f.name }}">{{ f.label }}<output id="o_{{ f.name }}">{{ val }}</output></label>
+            <input type="range" id="{{ f.name }}" name="{{ f.name }}" min="{{ f.min }}" max="{{ f.max }}"
+                   step="{{ f.step }}" value="{{ val }}"
+                   oninput="document.getElementById('o_{{ f.name }}').textContent=this.value">
+          {% else %}
+            <label for="{{ f.name }}">{{ f.label }}</label>
+            <input type="number" id="{{ f.name }}" name="{{ f.name }}" min="{{ f.min }}" max="{{ f.max }}"
+                   step="{{ f.step }}" value="{{ val }}" required>
+          {% endif %}
         </div>
-        <div class="field">
-          <label for="coapplicant_income">Co-applicant income (monthly)</label>
-          <input id="coapplicant_income" type="number" name="coapplicant_income" min="0" step="any" value="{{ v.coapplicant_income }}" required>
-        </div>
-        <div class="field">
-          <label for="loan_amount">Loan amount (in thousands)</label>
-          <input id="loan_amount" type="number" name="loan_amount" min="1" step="any" value="{{ v.loan_amount }}" required>
-          <small>Enter 130 for a loan of 130,000.</small>
-        </div>
-        <div class="field">
-          <label for="loan_term">Loan term (months)</label>
-          <input id="loan_term" type="number" name="loan_term" min="12" max="480" step="any" value="{{ v.loan_term }}" required>
-        </div>
-        <div class="field">
-          <label for="credit_history">Credit history</label>
-          <select id="credit_history" name="credit_history">
-            {% for o in credit %}<option value="{{ o }}" {{ 'selected' if v.credit_history == o }}>{{ o }}</option>{% endfor %}
-          </select>
-          <small>Good means past debts were repaid on time.</small>
-        </div>
+        {% endfor %}
       </div>
- 
-      <button type="submit">Check approval chance</button>
-    </form>
- 
-    {% if error %}
-      <div class="error">{{ error }}</div>
-    {% endif %}
- 
-    {% if result %}
-      <section class="result {{ 'ok' if result.approved else 'no' }}">
-        <div class="badge">{{ result.headline_pct }}%</div>
-        <div>
-          <h3>{{ 'Likely approved' if result.approved else 'Likely rejected' }}</h3>
-          <p>
-            {% if result.approved %}
-              The model sees a {{ result.approve_pct }}% chance this loan is approved.
-            {% else %}
-              The model sees a {{ result.reject_pct }}% chance this loan is rejected.
-            {% endif %}
-          </p>
-          <div class="bar">
-            <span style="width: {{ result.approve_pct }}%"></span>
-            <span style="width: {{ result.reject_pct }}%"></span>
-          </div>
-          <div class="bar-labels">
-            <span class="a">Approve {{ result.approve_pct }}%</span>
-            <span class="r">Reject {{ result.reject_pct }}%</span>
-          </div>
-        </div>
-      </section>
-    {% endif %}
-  </main>
- 
+    {% endfor %}
+    </div>
+    <div class="actions">
+      <button type="submit">🏦 Check Loan Approval</button>
+      <a class="reset" href="/">↺ Reset</a>
+    </div>
+  </form>
+  <footer>Built with Flask &amp; scikit-learn. This is a statistical estimate only and does not
+    represent a lender's final decision.</footer>
 </div>
 </body>
 </html>
 """
  
  
-def render(values, result=None, error=None):
-    return render_template_string(
-        PAGE,
-        v=values,
-        result=result,
-        error=error,
-        gender=GENDER.keys(),
-        married=MARRIED.keys(),
-        dependents=DEPENDENTS.keys(),
-        education=EDUCATION.keys(),
-        self_employed=SELF_EMPLOYED.keys(),
-        credit=CREDIT.keys(),
-        property_area=PROPERTY.keys(),
-    )
- 
- 
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
 @app.route("/", methods=["GET", "POST"])
 def index():
-    if request.method == "GET":
-        return render(DEFAULTS)
+    result, error, values = None, None, {}
  
-    form = request.form
-    values = {k: form.get(k, DEFAULTS[k]) for k in DEFAULTS}
+    if request.method == "POST":
+        values = request.form.to_dict()
+        try:
+            v = {name: float(values[name]) for name in FEATURES}
+            X = pd.DataFrame([v])[FEATURES]
  
-    try:
-        row = {
-            "Gender": GENDER[values["gender"]],
-            "Married": MARRIED[values["married"]],
-            "Dependents": DEPENDENTS[values["dependents"]],
-            "Education": EDUCATION[values["education"]],
-            "Self_Employed": SELF_EMPLOYED[values["self_employed"]],
-            "ApplicantIncome": float(values["applicant_income"]),
-            "CoapplicantIncome": float(values["coapplicant_income"]),
-            "LoanAmount": float(values["loan_amount"]),
-            "Loan_Amount_Term": float(values["loan_term"]),
-            "Credit_History": CREDIT[values["credit_history"]],
-            "Property_Area": PROPERTY[values["property_area"]],
-        }
-        if row["ApplicantIncome"] < 0 or row["CoapplicantIncome"] < 0 or row["LoanAmount"] <= 0:
-            raise ValueError
-    except (KeyError, ValueError):
-        return render(values, error="Please check your inputs. Every field needs a valid value.")
+            proba = model.predict_proba(X)[0]
+            p_yes = round(float(proba[CLASSES.index(1)]) * 100, 1)
+            p_no = round(100 - p_yes, 1)
  
-    X = pd.DataFrame([row])[FEATURES]
-    proba = model.predict_proba(X)[0]
-    approve_p = float(proba[list(model.classes_).index(1)])
+            result = {"p_yes": p_yes, "p_no": p_no, "tips": build_tips(v), **verdict_info(p_yes)}
+        except (KeyError, ValueError) as e:
+            error = f"Please fill every field with valid values ({e})."
+        except Exception as e:  # noqa: BLE001
+            error = f"Prediction failed: {e}"
  
-    approve_pct = round(approve_p * 100, 1)
-    reject_pct = round(100 - approve_pct, 1)
-    approved = approve_p >= 0.5
- 
-    result = {
-        "approved": approved,
-        "approve_pct": approve_pct,
-        "reject_pct": reject_pct,
-        "headline_pct": round(approve_pct if approved else reject_pct),
-    }
-    return render(values, result=result)
+    return render_template_string(
+        TEMPLATE, sections=SECTIONS, values=values, result=result, error=error
+    )
  
  
 if __name__ == "__main__":
